@@ -4,10 +4,10 @@ A Streamlit web app that **forecasts retail prices** and **estimates prices acro
 in Bangladesh. Visitors land on an intro page, then continue with just a name or phone number (no password) to use the
 app and earn points. Administrators can upload real monthly prices and retrain the forecast model from inside the app.
 
-**Spatial-aware forecasting experiment.** The Cross-district tab now also has a research experiment that tests
-whether neighbouring districts' prices improve forecasting compared with a district's own price history alone (see
-"Spatial-aware forecasting experiment" below). It adds to the tab without changing the existing price-ratio estimate,
-and the Forecast tab and its model are untouched.
+**Spatial-aware forecasting experiment.** A research experiment that tests whether neighbouring districts' prices
+improve forecasting compared with a district's own price history alone (see "Spatial-aware forecasting experiment"
+below). Users see the two resulting forecasts in the Cross-district tab; the accuracy comparison is for administrators,
+in Admin > Results. The existing price-ratio estimate, the Forecast tab and its model are untouched.
 
 **Version 2.1.** The Submit-a-price tab no longer has a date to pick - a submission is always for the current
 month, automatically. Dates shown anywhere in the app (tables, the admin "view all data" and upload preview,
@@ -26,10 +26,10 @@ After the landing page and a one-field login (name or phone number - see "Accoun
 | Tab | What it does |
 |---|---|
 | **Forecast** | Predicts the price of a commodity in a district for 1 to 18 months, starting next month. Shows a chart, a downloadable table, the data basis, and a second chart comparing that commodity's latest price across every district. |
-| **Cross-district** | Enter the known price in one district and get an estimate for another district (price-ratio method), with a chart of both districts' real yearly prices. Also contains the **Spatial-aware forecasting experiment**, which compares a forecast model using only a district's own history against the same model with neighbouring districts' prices added. |
+| **Cross-district** | Enter the known price in one district and get an estimate for another district (price-ratio method), with a chart of both districts' real yearly prices. Also shows a **Spatial-aware forecast**: a baseline forecast from the district's own history next to one that also uses neighbouring districts' prices. |
 | **Budget planner** | Enter a budget and a time horizon; ranks district/commodity combinations by predicted price rise, keeping only what the budget can afford. Fish is excluded by default (it doesn't store like rice or other durable goods). Costs one free run or one point per use - see "Points" below. |
 | **Submit a price** | A (district, commodity, price) submission for the current month - the month is always "now", it isn't a choice. One that matches the recent trend for that item is added immediately and earns a point right away; one that looks like an unusual spike or drop is held for an administrator to check first - see "Submission review" below. |
-| **Admin** (password) | Live dataset statistics by commodity and category, a Results tab with current model accuracy and submission/points insight, upload monthly prices as CSV with automatic checks, review flagged public submissions, undo an upload, retrain the forecast model with a safe test before replacing it, and see the numbers behind each result (including a "view all data" option in the Forecast and Cross-district tabs). |
+| **Admin** (password) | Live dataset statistics by commodity and category, a Results tab with current model accuracy, the spatial-aware experiment's Set A vs Set B comparison, and submission/points insight, upload monthly prices as CSV with automatic checks, review flagged public submissions, undo an upload, retrain the forecast model with a safe test before replacing it, and see the numbers behind each result (including a "view all data" option in the Forecast and Cross-district tabs). |
 
 ## Quick start
 
@@ -74,7 +74,7 @@ generated series. The app always shows which one a forecast is based on.
 **Cross-district.** For every year in which both districts have a price, the target price is divided by the source price.
 The average of these ratios is multiplied by the price you enter. It uses only the real yearly prices.
 
-**Spatial-aware forecasting experiment (Cross-district tab).** A separate experiment for the research question
+**Spatial-aware forecasting experiment (Cross-district tab and Admin > Results).** A separate experiment for the research question
 *"does adding neighbouring district prices improve forecasting compared with using only the target district's own
 history?"* It is not the price-ratio estimate above: here neighbouring prices are given to the model as input
 features, and the model has to learn whether they help. The same XGBoost model (same settings, same seed) is
@@ -105,11 +105,16 @@ the forecast is made or the month before, never from the month being predicted.
   5 or more test rows). "Improvement" is (A - B) / A, so a positive number means Set B made smaller errors.
   Results can be shown for one district and commodity, one commodity across all districts, or everything; the
   single-series view has only as many test rows as test months, so conclusions should rest on the wider views.
-- The app also shows both models' next prediction, a chart of real vs predicted prices over the test months, and
-  how much of Set B's learning came from the spatial features (feature importance).
+- **Where it appears.** Ordinary users see only the forecasts, in the Cross-district tab: the district's
+  neighbours with their latest prices, and the baseline and spatial-aware forecasts side by side. Model-evaluation
+  metrics are for administrators, so everything else is in **Admin > Results**: the MAE/RMSE/MAPE/R² comparison,
+  the verdict, a chart of real vs predicted prices over the test months, how much of Set B's learning came from the
+  spatial features (feature importance), and the data checks. Admin > Results has its own district, commodity,
+  horizon and test-months controls.
 
-The experiment only starts after pressing **Run experiment** (training takes a few seconds, and Streamlit runs
-every tab on each click); after that, results are cached and changing the district or commodity is instant.
+Nothing is trained until **Show forecast** (Cross-district) or **Run experiment** (Admin > Results) is pressed,
+because training takes a few seconds and Streamlit runs every tab on each click. Both places share one cache, so the
+models are trained once per data version, horizon and test window; changing the district or commodity is instant.
 
 **Reading the result on generated data.** On the current dataset Set A and Set B score within about 1% of each
 other and the spatial features carry almost no importance. That is expected: each generated monthly series has

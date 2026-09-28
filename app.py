@@ -124,6 +124,142 @@ def get_spatial_experiment(signature, horizon, test_months):
                                      horizon=horizon, test_months=test_months)
 
 
+SPATIAL_DEFAULT_TEST_MONTHS = 3     # test window used when the public Cross-district view needs the models
+
+
+def render_spatial_evaluation(experiment, neighbours, monthly, loc, comm, horizon):
+    """Set A vs Set B accuracy on the held-out months - shown in Admin -> Results only.
+
+    Model-evaluation metrics are for administrators and research, so ordinary users see just the two forecasts
+    in the Cross-district tab. The experiment is trained by get_spatial_experiment; this function only displays it.
+    """
+    # --- performance comparison on the held-out months
+    with st.container(border=True):
+        st.markdown("**Performance on the held-out test months**")
+        scope_labels = {f"{comm}, all districts": (None, comm),
+                        f"{loc} · {comm} only": (loc, comm),
+                        "Every district and commodity": (None, None)}
+        scope = st.radio("Measure accuracy on", list(scope_labels), horizontal=True, key="spa_scope",
+                         help="The single-series view has only as many test rows as test months, so it "
+                              "is shown for illustration; the wider views are what a conclusion should "
+                              "rest on.")
+        try:
+            score = dt.score_spatial_experiment(experiment, *scope_labels[scope])
+        except ValueError as error:
+            st.warning(str(error))
+            score = None
+
+        if score is not None:
+            base, spat = score["baseline"], score["spatial"]
+
+            def fmt_r2(value):
+                return "—" if value is None else f"{value:.3f}"
+
+            a_col, b_col, i_col = st.columns(3)
+            with a_col:
+                st.markdown("**Baseline (Set A)**")
+                st.metric("MAE", f"{base['mae']:.2f} Tk/kg", border=True)
+                st.metric("RMSE", f"{base['rmse']:.2f} Tk/kg", border=True)
+            with b_col:
+                st.markdown("**Spatial-aware (Set B)**")
+                st.metric("MAE", f"{spat['mae']:.2f} Tk/kg", border=True)
+                st.metric("RMSE", f"{spat['rmse']:.2f} Tk/kg", border=True)
+            with i_col:
+                st.markdown("**Improvement (B vs A)**")
+                st.metric("MAE", f"{score['improvement_mae_pct']:+.2f}%", border=True,
+                          help="Positive = the spatial-aware model's errors were smaller.")
+                st.metric("RMSE", f"{score['improvement_rmse_pct']:+.2f}%", border=True)
+
+            st.dataframe(pd.DataFrame({
+                "Metric": ["MAE (Tk/kg)", "RMSE (Tk/kg)", "MAPE (%)", "R²"],
+                "Baseline (Set A)": [f"{base['mae']:.3f}", f"{base['rmse']:.3f}", f"{base['mape']:.3f}", fmt_r2(base["r2"])],
+                "Spatial-aware (Set B)": [f"{spat['mae']:.3f}", f"{spat['rmse']:.3f}", f"{spat['mape']:.3f}", fmt_r2(spat["r2"])],
+            }), hide_index=True)
+            st.caption(f"{base['n']:,} test rows · {experiment['train_rows']:,} training rows · "
+                       f"Set B had the smaller error on {score['b_wins_pct']:.0f}% of test rows · "
+                       f"for reference, simply repeating the current price gives MAE "
+                       f"{score['naive']['mae']:.2f}. R² is shown only with 5+ test rows.")
+
+            # Plain-language verdict. A difference under 1% is treated as "no meaningful difference"
+            # rather than a win or a loss, because with this much data that is within run-to-run noise.
+            gain = score["improvement_mae_pct"]
+            if abs(gain) < 1:
+                st.info(f"No meaningful difference: adding neighbouring-district prices changed MAE by "
+                        f"{gain:+.2f}%.")
+            elif gain > 0:
+                st.success(f"Adding neighbouring-district prices reduced MAE by {gain:.1f}%.")
+            else:
+                st.warning(f"Adding neighbouring-district prices increased MAE by {-gain:.1f}%.")
+
+            # Test period chart for the selected series: real price vs both models' predictions.
+            rows = experiment["results"]
+            rows = rows[(rows["location"] == loc) & (rows["commodity"] == comm)]
+            hist = monthly[(monthly["location"] == loc) & (monthly["commodity"] == comm)
+                              & (monthly["date"] <= dt.current_month_start())].sort_values("date").tail(12)
+            if not rows.empty:
+                chart_data = pd.concat([
+                    hist[["date", "price_per_kg"]].rename(columns={"price_per_kg": "price"}).assign(kind="Actual"),
+                    rows[["target_date", "pred_a"]].rename(columns={"target_date": "date", "pred_a": "price"})
+                        .assign(kind="Baseline (A)"),
+                    rows[["target_date", "pred_b"]].rename(columns={"target_date": "date", "pred_b": "price"})
+                        .assign(kind="Spatial-aware (B)"),
+                ], ignore_index=True)
+                kinds = ["Actual", "Baseline (A)", "Spatial-aware (B)"]
+                test_chart = (
+                    alt.Chart(chart_data)
+                    .mark_line(point=True, strokeWidth=2.2)
+                    .encode(
+                        x=alt.X("date:T", title=None, axis=alt.Axis(format="%b %Y")),
+                        y=alt.Y("price:Q", title="Tk per kg", scale=alt.Scale(zero=False)),
+                        color=alt.Color("kind:N", legend=alt.Legend(title=None, orient="top"),
+                                        scale=alt.Scale(domain=kinds, range=["#14705A", "#C97A1A", "#1F6FB2"])),
+                        strokeDash=alt.StrokeDash("kind:N", legend=None,
+                                                  scale=alt.Scale(domain=kinds, range=[[1, 0], [6, 4], [2, 2]])),
+                        tooltip=[alt.Tooltip("date:T", title="Month", format="%b %Y"),
+                                 alt.Tooltip("price:Q", title="Tk/kg", format=".2f"),
+                                 alt.Tooltip("kind:N", title="")],
+                    )
+                    .properties(height=280)
+                )
+                st.altair_chart(test_chart, width="stretch")
+                st.caption(f"{loc} · {comm}: real price and both models' predictions for the held-out "
+                           f"months ({horizon} month(s) ahead).")
+
+            if score["real_rows"] == 0:
+                st.info("**Read this before drawing conclusions.** Every test row here uses the generated "
+                        "monthly series, which were built from each district's two yearly averages plus "
+                        "random noise drawn *independently for each district*. Neighbouring districts "
+                        "therefore share a trend but no month-to-month movement, so there is very little "
+                        "real spatial signal for Set B to learn. Once real monthly prices are uploaded, "
+                        "this same experiment runs on them automatically.")
+
+    # --- did the model actually use the spatial inputs?
+    with st.expander("What the spatial model learned"):
+        importance, spatial_share = dt.spatial_feature_importance(experiment)
+        st.markdown(f"Share of Set B's total split gain coming from the spatial features: "
+                    f"**{spatial_share:.3f}%**. Near 0% means the model found almost nothing in them "
+                    "that the district's own history did not already tell it.")
+        st.dataframe(importance.assign(gain_share_pct=importance["gain_share_pct"].round(4)).rename(
+            columns={"feature": "Spatial feature", "gain_share_pct": "Share of total gain (%)"}),
+            hide_index=True)
+        st.caption("nbr_mean_price / nbr_mean_lag1: average neighbour price this month / last month · "
+                   "div_mean_price: average of the rest of the division · "
+                   f"ref_gap: this district's price minus {dt.REFERENCE_DISTRICT}'s.")
+
+    # --- data checks for administrators
+    with st.expander("Details"):
+        unknown = dt.check_neighbour_names(neighbours, monthly["location"].unique())
+        if unknown:
+            st.caption("Names in the neighbour file with no price data (fine if the district simply has no prices "
+                       "yet; otherwise check the spelling): " + ", ".join(unknown))
+        if score is not None:
+            st.caption(f"Every test row in the current view ({len(score['rows']):,}), with both models' predictions.")
+            st.dataframe(score["rows"].assign(
+                date=score["rows"]["date"].dt.strftime("%Y-%m"),
+                target_date=score["rows"]["target_date"].dt.strftime("%Y-%m")).round(2),
+                hide_index=True, height=260)
+
+
 def get_admin_password():
     """The admin password comes from .streamlit/secrets.toml or the ADMIN_PASSWORD environment variable."""
     try:
@@ -467,17 +603,17 @@ with tab_cross:
                               f"{len(district_df):,} rows.")
                     st.dataframe(district_df, hide_index=True, height=320)
 
-    # ------------------------------------------------------------ NEW: spatial-aware forecasting experiment
-    # Everything above this line is the original price-ratio estimate, unchanged. This section is a separate
-    # experiment: it trains the Forecast model's algorithm twice - once on the target district's own history
-    # (Set A), once with neighbouring districts' prices added as input features (Set B) - and compares them.
+    # ------------------------------------------------------------ spatial-aware forecast (public view)
+    # Everything above this line is the original price-ratio estimate, unchanged. This section shows two
+    # forecasts for the same district: one from its own price history only (Set A, the baseline) and one that
+    # also sees its neighbouring districts' prices (Set B, spatial-aware). HOW ACCURATE the two are is model
+    # evaluation, which lives in Admin -> Results (render_spatial_evaluation) - ordinary users only see forecasts.
     st.divider()
     with st.container(border=True):
-        st.subheader("Spatial-aware forecasting experiment")
-        st.caption("Does knowing the prices in neighbouring districts help forecast a district's price? "
-                   "The same model is trained twice on the same months: **Set A** sees only the district's own "
-                   "price history; **Set B** also sees its geographic neighbours' prices, its division's average "
-                   f"and its price gap to {dt.REFERENCE_DISTRICT}. Both are tested on the same held-out months.")
+        st.subheader("Spatial-aware forecast")
+        st.caption("Two forecasts for the same district. The **baseline** uses only that district's own price "
+                   "history; the **spatial-aware** forecast also takes into account its neighbouring districts' "
+                   f"prices, its division's average and its price gap to {dt.REFERENCE_DISTRICT}.")
 
         try:
             sp_neighbours, sp_divisions = get_spatial_inputs(dt.spatial_signature())
@@ -485,50 +621,46 @@ with tab_cross:
             sp_neighbours = None
             st.error(str(error))
 
+        sp_comm = None
         if sp_neighbours is not None:
             sp_locations = sorted(monthly_df["location"].unique())
-            s1, s2 = st.columns(2)
-            sp_loc = s1.selectbox("Target district", sp_locations, index=index_of(sp_locations, "Dhaka"), key="sp_loc")
+            s1, s2, s3 = st.columns([1, 1, 1])
+            sp_loc = s1.selectbox("District", sp_locations, index=index_of(sp_locations, "Dhaka"), key="sp_loc")
             sp_counts = monthly_df[monthly_df["location"] == sp_loc].groupby("commodity").size()
             sp_commodities = sorted(sp_counts[sp_counts >= 4].index.tolist())
             sp_comm = s2.selectbox("Commodity", sp_commodities, index=index_of(sp_commodities, "Broiler chicken"),
                                    key="sp_comm") if sp_commodities else None
-            s3, s4 = st.columns(2)
-            sp_h = s3.slider("Forecast horizon (months ahead)", 1, dt.SPATIAL_MAX_HORIZON, 1, key="sp_h",
-                             help="1 = next month, the same target as the Forecast tab's model. Longer horizons "
-                                  "are predicted directly (month t → month t+h) rather than step by step.")
-            sp_test = s4.select_slider("Test months held out", options=[2, 3, 4, 5, 6], value=3, key="sp_test",
-                                       help="The most recent months are hidden from both models during training "
-                                            "and used only to measure their accuracy.")
+            sp_h = s3.slider("Months ahead", 1, dt.SPATIAL_MAX_HORIZON, 1, key="sp_h",
+                             help="1 = next month.")
 
-            # Training both models takes a few seconds, and Streamlit runs every tab's code on each interaction,
-            # so the experiment only starts after this button - the rest of the app is never slowed down by it.
-            if st.button("Run experiment", type="primary", key="sp_run"):
+            # Training the models takes a few seconds, and Streamlit runs every tab's code on each interaction,
+            # so nothing is trained until this button - the rest of the app is never slowed down by it.
+            if st.button("Show forecast", type="primary", key="sp_run"):
                 st.session_state["sp_started"] = True
 
-    if sp_neighbours is not None and sp_comm and st.session_state.get("sp_started"):
+    if sp_comm and st.session_state.get("sp_started"):
         try:
-            with st.spinner("Training both models on the same data..."):
-                experiment = get_spatial_experiment(dt.spatial_signature(), sp_h, sp_test)
+            with st.spinner("Preparing the forecast..."):
+                experiment = get_spatial_experiment(dt.spatial_signature(), sp_h, SPATIAL_DEFAULT_TEST_MONTHS)
         except ValueError as error:
             st.error(str(error))
             experiment = None
 
         if experiment is not None:
-            # --- 1. which neighbours feed the spatial features
+            # --- which neighbours feed the spatial-aware forecast
             with st.container(border=True):
-                st.markdown(f"**Neighbours of {sp_loc}** ({sp_divisions.get(sp_loc, '?')} division) "
-                            "- from `data/reference/district_neighbors.csv`")
+                st.markdown(f"**Neighbouring districts of {sp_loc}** ({sp_divisions.get(sp_loc, '?')} division)")
                 nb_table = dt.neighbour_prices(monthly_df, sp_neighbours, sp_divisions, sp_loc, sp_comm)
                 if nb_table.empty:
-                    st.warning(f"{sp_loc} has no neighbours listed in the neighbour file.")
+                    st.warning(f"{sp_loc} has no neighbouring districts listed.")
                 else:
                     st.dataframe(nb_table, hide_index=True)
                     if (nb_table["Sells this commodity"] == "no").all():
-                        st.warning(f"None of {sp_loc}'s neighbours has prices for {sp_comm}, so for this series "
-                                   "Set B can only use the division average and the reference-market gap.")
+                        st.warning(f"None of {sp_loc}'s neighbours has prices for {sp_comm}, so the spatial-aware "
+                                   "forecast can only use the division average and the price gap to "
+                                   f"{dt.REFERENCE_DISTRICT}.")
 
-            # --- 2. live predictions from both models
+            # --- the two forecasts
             try:
                 pred = dt.spatial_prediction(experiment, monthly_df, sp_loc, sp_comm)
             except ValueError as error:
@@ -537,138 +669,20 @@ with tab_cross:
             if pred is not None:
                 p1, p2, p3 = st.columns(3)
                 p1.metric(f"Latest known ({pred['last_date']:%b %Y})", f"{pred['last_price']:.2f} Tk/kg", border=True)
-                p2.metric(f"Baseline prediction ({pred['target_date']:%b %Y})", f"{pred['pred_a']:.2f} Tk/kg",
+                p2.metric(f"Baseline forecast ({pred['target_date']:%b %Y})", f"{pred['pred_a']:.2f} Tk/kg",
                           f"{(pred['pred_a'] / pred['last_price'] - 1) * 100:+.1f}% vs now", delta_color="off", border=True)
-                p3.metric(f"Spatial-aware prediction ({pred['target_date']:%b %Y})", f"{pred['pred_b']:.2f} Tk/kg",
+                p3.metric(f"Spatial-aware forecast ({pred['target_date']:%b %Y})", f"{pred['pred_b']:.2f} Tk/kg",
                           f"{(pred['pred_b'] / pred['last_price'] - 1) * 100:+.1f}% vs now", delta_color="off", border=True)
+                if pred["source"] != "uploaded":
+                    st.caption("Based on estimated monthly prices, not on observed monthly market data.")
+                st.warning(FORECAST_DISCLAIMER)
 
-            # --- 3. performance comparison on the held-out months
-            with st.container(border=True):
-                st.markdown("**Performance on the held-out test months**")
-                scope_labels = {f"{sp_comm}, all districts": (None, sp_comm),
-                                f"{sp_loc} · {sp_comm} only": (sp_loc, sp_comm),
-                                "Every district and commodity": (None, None)}
-                scope = st.radio("Measure accuracy on", list(scope_labels), horizontal=True, key="sp_scope",
-                                 help="The single-series view has only as many test rows as test months, so it "
-                                      "is shown for illustration; the wider views are what a conclusion should "
-                                      "rest on.")
-                try:
-                    score = dt.score_spatial_experiment(experiment, *scope_labels[scope])
-                except ValueError as error:
-                    st.warning(str(error))
-                    score = None
-
-                if score is not None:
-                    base, spat = score["baseline"], score["spatial"]
-
-                    def fmt_r2(value):
-                        return "—" if value is None else f"{value:.3f}"
-
-                    a_col, b_col, i_col = st.columns(3)
-                    with a_col:
-                        st.markdown("**Baseline (Set A)**")
-                        st.metric("MAE", f"{base['mae']:.2f} Tk/kg", border=True)
-                        st.metric("RMSE", f"{base['rmse']:.2f} Tk/kg", border=True)
-                    with b_col:
-                        st.markdown("**Spatial-aware (Set B)**")
-                        st.metric("MAE", f"{spat['mae']:.2f} Tk/kg", border=True)
-                        st.metric("RMSE", f"{spat['rmse']:.2f} Tk/kg", border=True)
-                    with i_col:
-                        st.markdown("**Improvement (B vs A)**")
-                        st.metric("MAE", f"{score['improvement_mae_pct']:+.2f}%", border=True,
-                                  help="Positive = the spatial-aware model's errors were smaller.")
-                        st.metric("RMSE", f"{score['improvement_rmse_pct']:+.2f}%", border=True)
-
-                    st.dataframe(pd.DataFrame({
-                        "Metric": ["MAE (Tk/kg)", "RMSE (Tk/kg)", "MAPE (%)", "R²"],
-                        "Baseline (Set A)": [f"{base['mae']:.3f}", f"{base['rmse']:.3f}", f"{base['mape']:.3f}", fmt_r2(base["r2"])],
-                        "Spatial-aware (Set B)": [f"{spat['mae']:.3f}", f"{spat['rmse']:.3f}", f"{spat['mape']:.3f}", fmt_r2(spat["r2"])],
-                    }), hide_index=True)
-                    st.caption(f"{base['n']:,} test rows · {experiment['train_rows']:,} training rows · "
-                               f"Set B had the smaller error on {score['b_wins_pct']:.0f}% of test rows · "
-                               f"for reference, simply repeating the current price gives MAE "
-                               f"{score['naive']['mae']:.2f}. R² is shown only with 5+ test rows.")
-
-                    # Plain-language verdict. A difference under 1% is treated as "no meaningful difference"
-                    # rather than a win or a loss, because with this much data that is within run-to-run noise.
-                    gain = score["improvement_mae_pct"]
-                    if abs(gain) < 1:
-                        st.info(f"No meaningful difference: adding neighbouring-district prices changed MAE by "
-                                f"{gain:+.2f}%.")
-                    elif gain > 0:
-                        st.success(f"Adding neighbouring-district prices reduced MAE by {gain:.1f}%.")
-                    else:
-                        st.warning(f"Adding neighbouring-district prices increased MAE by {-gain:.1f}%.")
-
-                    # Test period chart for the selected series: real price vs both models' predictions.
-                    rows = experiment["results"]
-                    rows = rows[(rows["location"] == sp_loc) & (rows["commodity"] == sp_comm)]
-                    hist = monthly_df[(monthly_df["location"] == sp_loc) & (monthly_df["commodity"] == sp_comm)
-                                      & (monthly_df["date"] <= dt.current_month_start())].sort_values("date").tail(12)
-                    if not rows.empty:
-                        chart_data = pd.concat([
-                            hist[["date", "price_per_kg"]].rename(columns={"price_per_kg": "price"}).assign(kind="Actual"),
-                            rows[["target_date", "pred_a"]].rename(columns={"target_date": "date", "pred_a": "price"})
-                                .assign(kind="Baseline (A)"),
-                            rows[["target_date", "pred_b"]].rename(columns={"target_date": "date", "pred_b": "price"})
-                                .assign(kind="Spatial-aware (B)"),
-                        ], ignore_index=True)
-                        kinds = ["Actual", "Baseline (A)", "Spatial-aware (B)"]
-                        test_chart = (
-                            alt.Chart(chart_data)
-                            .mark_line(point=True, strokeWidth=2.2)
-                            .encode(
-                                x=alt.X("date:T", title=None, axis=alt.Axis(format="%b %Y")),
-                                y=alt.Y("price:Q", title="Tk per kg", scale=alt.Scale(zero=False)),
-                                color=alt.Color("kind:N", legend=alt.Legend(title=None, orient="top"),
-                                                scale=alt.Scale(domain=kinds, range=["#14705A", "#C97A1A", "#1F6FB2"])),
-                                strokeDash=alt.StrokeDash("kind:N", legend=None,
-                                                          scale=alt.Scale(domain=kinds, range=[[1, 0], [6, 4], [2, 2]])),
-                                tooltip=[alt.Tooltip("date:T", title="Month", format="%b %Y"),
-                                         alt.Tooltip("price:Q", title="Tk/kg", format=".2f"),
-                                         alt.Tooltip("kind:N", title="")],
-                            )
-                            .properties(height=280)
-                        )
-                        st.altair_chart(test_chart, width="stretch")
-                        st.caption(f"{sp_loc} · {sp_comm}: real price and both models' predictions for the held-out "
-                                   f"months ({sp_h} month(s) ahead).")
-
-                    if score["real_rows"] == 0:
-                        st.info("**Read this before drawing conclusions.** Every test row here uses the generated "
-                                "monthly series, which were built from each district's two yearly averages plus "
-                                "random noise drawn *independently for each district*. Neighbouring districts "
-                                "therefore share a trend but no month-to-month movement, so there is very little "
-                                "real spatial signal for Set B to learn. Once real monthly prices are uploaded, "
-                                "this same experiment runs on them automatically.")
-
-            # --- 4. did the model actually use the spatial inputs?
-            with st.expander("What the spatial model learned"):
-                importance, spatial_share = dt.spatial_feature_importance(experiment)
-                st.markdown(f"Share of Set B's total split gain coming from the spatial features: "
-                            f"**{spatial_share:.3f}%**. Near 0% means the model found almost nothing in them "
-                            "that the district's own history did not already tell it.")
-                st.dataframe(importance.assign(gain_share_pct=importance["gain_share_pct"].round(4)).rename(
-                    columns={"feature": "Spatial feature", "gain_share_pct": "Share of total gain (%)"}),
-                    hide_index=True)
-                st.caption("nbr_mean_price / nbr_mean_lag1: average neighbour price this month / last month · "
-                           "div_mean_price: average of the rest of the division · "
-                           f"ref_gap: this district's price minus {dt.REFERENCE_DISTRICT}'s.")
-
-            if st.session_state.get("is_admin", False):
-                with st.expander("Details (administrators only)"):
-                    if pred is not None:
-                        st.write("Spatial inputs used for the live prediction:",
+                if st.session_state.get("is_admin", False):
+                    with st.expander("Details (administrators only)"):
+                        st.write("Spatial inputs used for this forecast:",
                                  {k: (None if pd.isna(v) else round(v, 2)) for k, v in pred["spatial_inputs"].items()})
-                    unknown = dt.check_neighbour_names(sp_neighbours, monthly_df["location"].unique())
-                    if unknown:
-                        st.caption("Names in the neighbour file with no price data (fine if the district simply "
-                                   "has no prices yet; otherwise check the spelling): " + ", ".join(unknown))
-                    if score is not None:
-                        st.dataframe(score["rows"].assign(
-                            date=score["rows"]["date"].dt.strftime("%Y-%m"),
-                            target_date=score["rows"]["target_date"].dt.strftime("%Y-%m")).round(2),
-                            hide_index=True, height=260)
+                        st.caption("How accurate the two forecasts are: Admin → Results → "
+                                   "Spatial-aware forecasting experiment.")
 
 # ================================================================ TAB 3: BUDGET PLANNER
 with tab_budget:
@@ -882,6 +896,49 @@ with tab_admin:
                     .properties(height=240)
                 )
                 st.altair_chart(chart, width="stretch")
+
+            # ---- spatial-aware forecasting experiment (Gap 2): Set A vs Set B accuracy. Moved here from the
+            # Cross-district tab so ordinary users only see the forecasts, not model-evaluation metrics.
+            st.subheader("Spatial-aware forecasting experiment")
+            st.caption("Does knowing the prices in neighbouring districts help forecast a district's price? The "
+                       "same model is trained twice on the same months: **Set A** sees only the district's own price "
+                       "history; **Set B** also sees its geographic neighbours' prices, its division's average and "
+                       f"its price gap to {dt.REFERENCE_DISTRICT}. Both are tested on the same held-out months.")
+            try:
+                spa_neighbours, _ = get_spatial_inputs(dt.spatial_signature())
+            except ValueError as error:
+                spa_neighbours = None
+                st.error(str(error))
+
+            if spa_neighbours is not None:
+                spa_locations = sorted(monthly_df["location"].unique())
+                a1, a2 = st.columns(2)
+                spa_loc = a1.selectbox("Target district", spa_locations, index=index_of(spa_locations, "Dhaka"),
+                                       key="spa_loc")
+                spa_counts = monthly_df[monthly_df["location"] == spa_loc].groupby("commodity").size()
+                spa_commodities = sorted(spa_counts[spa_counts >= 4].index.tolist())
+                spa_comm = a2.selectbox("Commodity", spa_commodities,
+                                        index=index_of(spa_commodities, "Broiler chicken"),
+                                        key="spa_comm") if spa_commodities else None
+                a3, a4 = st.columns(2)
+                spa_h = a3.slider("Forecast horizon (months ahead)", 1, dt.SPATIAL_MAX_HORIZON, 1, key="spa_h",
+                                  help="1 = next month, the same target as the Forecast tab's model. Longer horizons "
+                                       "are predicted directly (month t → month t+h) and leave fewer training months.")
+                spa_test = a4.select_slider("Test months held out", options=[2, 3, 4, 5, 6],
+                                            value=SPATIAL_DEFAULT_TEST_MONTHS, key="spa_test",
+                                            help="The most recent months are hidden from both models during "
+                                                 "training and used only to measure their accuracy.")
+                if st.button("Run experiment", type="primary", key="spa_run"):
+                    st.session_state["spa_started"] = True
+
+                if spa_comm and st.session_state.get("spa_started"):
+                    try:
+                        with st.spinner("Training both models on the same data..."):
+                            spa_experiment = get_spatial_experiment(dt.spatial_signature(), spa_h, spa_test)
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        render_spatial_evaluation(spa_experiment, spa_neighbours, monthly_df, spa_loc, spa_comm, spa_h)
 
             st.subheader("Public submissions")
             sub_stats = dt.submission_stats()
