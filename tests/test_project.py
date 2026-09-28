@@ -536,3 +536,56 @@ def test_submission_stats_count_each_outcome(sandbox, points_sandbox, monkeypatc
     assert stats["pending"] == 0
     assert stats["moderate"] == 1        # the one that was approved
     assert stats["severe"] == 1          # the one that was rejected
+
+
+# ---------------------------------------------------------------- spatial-aware forecasting experiment
+def _spatial_inputs():
+    return dt.load_effective_monthly(), dt.load_district_neighbours(), dt.load_district_divisions()
+
+
+def test_neighbour_file_is_symmetric_and_covers_every_district_with_prices():
+    monthly, neighbours, divisions = _spatial_inputs()
+    pairs = set(zip(neighbours["target_district"], neighbours["neighbour_district"]))
+    assert all((b, a) in pairs for a, b in pairs)                       # if A borders B, B borders A
+    assert set(monthly["location"]) <= set(neighbours["target_district"])
+    assert set(monthly["location"]) <= set(divisions)                   # every district has a division
+
+
+def test_spatial_table_at_horizon_1_has_the_forecast_models_rows_and_target():
+    monthly, neighbours, divisions = _spatial_inputs()
+    spatial = dt.build_spatial_training_table(monthly, neighbours, divisions, horizon=1)
+    base = dt.build_training_table(monthly)
+    assert len(spatial) == len(base)
+    merged = spatial.merge(base[["location", "commodity", "date", "target_next_month"]],
+                           on=["location", "commodity", "date"])
+    assert np.allclose(merged["target"], merged["target_next_month"])
+
+
+def test_neighbour_average_uses_the_same_month_not_the_predicted_one():
+    monthly, neighbours, divisions = _spatial_inputs()
+    table = dt.build_spatial_training_table(monthly, neighbours, divisions, horizon=1)
+    row = table[(table["location"] == "Dhaka") & (table["commodity"] == "Broiler chicken")].iloc[-1]
+    nbs = neighbours.loc[neighbours["target_district"] == "Dhaka", "neighbour_district"]
+    same_month = monthly[(monthly["commodity"] == "Broiler chicken") & monthly["location"].isin(nbs)
+                         & (monthly["date"] == row["date"])]
+    assert row["nbr_mean_price"] == pytest.approx(same_month["price_per_kg"].mean())
+
+
+def test_set_b_is_set_a_plus_only_the_spatial_features_and_set_a_matches_the_forecast_model():
+    monthly, neighbours, divisions = _spatial_inputs()
+    experiment = dt.run_spatial_experiment(monthly, neighbours, divisions, horizon=1)
+    assert experiment["features_b"] == experiment["features_a"] + dt.SPATIAL_FEATURES
+    _, live_features = dt.load_model()
+    assert set(experiment["features_a"]) == set(live_features)
+
+
+@pytest.mark.parametrize("horizon", [1, 3])
+def test_spatial_experiment_never_trains_on_a_price_after_the_first_test_forecast(horizon):
+    monthly, neighbours, divisions = _spatial_inputs()
+    experiment = dt.run_spatial_experiment(monthly, neighbours, divisions, horizon=horizon)
+    first_test = experiment["results"]["date"].min()
+    table = dt.build_spatial_training_table(monthly[monthly["date"] <= dt.current_month_start()],
+                                            neighbours, divisions, horizon)
+    assert experiment["train_rows"] == int((table["target_date"] <= first_test).sum())
+    score = dt.score_spatial_experiment(experiment, commodity="Broiler chicken")
+    assert score["baseline"]["n"] == score["spatial"]["n"] > 0          # both scored on the same rows

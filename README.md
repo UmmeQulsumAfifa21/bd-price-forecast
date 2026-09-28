@@ -4,6 +4,11 @@ A Streamlit web app that **forecasts retail prices** and **estimates prices acro
 in Bangladesh. Visitors land on an intro page, then continue with just a name or phone number (no password) to use the
 app and earn points. Administrators can upload real monthly prices and retrain the forecast model from inside the app.
 
+**Spatial-aware forecasting experiment.** The Cross-district tab now also has a research experiment that tests
+whether neighbouring districts' prices improve forecasting compared with a district's own price history alone (see
+"Spatial-aware forecasting experiment" below). It adds to the tab without changing the existing price-ratio estimate,
+and the Forecast tab and its model are untouched.
+
 **Version 2.1.** The Submit-a-price tab no longer has a date to pick - a submission is always for the current
 month, automatically. Dates shown anywhere in the app (tables, the admin "view all data" and upload preview,
 the CSV format guide) now consistently show just year and month, since every price in this app is monthly and
@@ -21,7 +26,7 @@ After the landing page and a one-field login (name or phone number - see "Accoun
 | Tab | What it does |
 |---|---|
 | **Forecast** | Predicts the price of a commodity in a district for 1 to 18 months, starting next month. Shows a chart, a downloadable table, the data basis, and a second chart comparing that commodity's latest price across every district. |
-| **Cross-district** | Enter the known price in one district and get an estimate for another district (price-ratio method), with a chart of both districts' real yearly prices. |
+| **Cross-district** | Enter the known price in one district and get an estimate for another district (price-ratio method), with a chart of both districts' real yearly prices. Also contains the **Spatial-aware forecasting experiment**, which compares a forecast model using only a district's own history against the same model with neighbouring districts' prices added. |
 | **Budget planner** | Enter a budget and a time horizon; ranks district/commodity combinations by predicted price rise, keeping only what the budget can afford. Fish is excluded by default (it doesn't store like rice or other durable goods). Costs one free run or one point per use - see "Points" below. |
 | **Submit a price** | A (district, commodity, price) submission for the current month - the month is always "now", it isn't a choice. One that matches the recent trend for that item is added immediately and earns a point right away; one that looks like an unusual spike or drop is held for an administrator to check first - see "Submission review" below. |
 | **Admin** (password) | Live dataset statistics by commodity and category, a Results tab with current model accuracy and submission/points insight, upload monthly prices as CSV with automatic checks, review flagged public submissions, undo an upload, retrain the forecast model with a safe test before replacing it, and see the numbers behind each result (including a "view all data" option in the Forecast and Cross-district tabs). |
@@ -68,6 +73,49 @@ generated series. The app always shows which one a forecast is based on.
 
 **Cross-district.** For every year in which both districts have a price, the target price is divided by the source price.
 The average of these ratios is multiplied by the price you enter. It uses only the real yearly prices.
+
+**Spatial-aware forecasting experiment (Cross-district tab).** A separate experiment for the research question
+*"does adding neighbouring district prices improve forecasting compared with using only the target district's own
+history?"* It is not the price-ratio estimate above: here neighbouring prices are given to the model as input
+features, and the model has to learn whether they help. The same XGBoost model (same settings, same seed) is
+trained twice on the same rows, with the same train/test split and the same target:
+
+| Feature set | Inputs |
+|---|---|
+| **Set A - baseline** | Exactly the Forecast model's inputs: this month's price, lag1-lag3, month number, time index, district and commodity. |
+| **Set B - spatial-aware** | Everything in Set A, plus: `nbr_mean_price` (average price across the district's geographic neighbours, this month), `nbr_mean_lag1` (the same average one month earlier), `div_mean_price` (average across the rest of the district's division) and `ref_gap` (this district's price minus Dhaka's). |
+
+So any difference in accuracy can only come from the spatial columns. Every spatial value is taken from the month
+the forecast is made or the month before, never from the month being predicted.
+
+- **Neighbours** come from a fixed geographic list, `data/reference/district_neighbors.csv` (one
+  `target_district, neighbour_district` pair per line, both directions listed). They are *not* chosen from price
+  correlations. Edit the file to add or remove a neighbour; nothing else needs to change.
+- **Divisions** are read from the `Division` column of the DAM raw files, so there is no second hand-typed list.
+- **Neighbour averages, not one column per neighbour.** The model is shared across every district, so a column like
+  "Gazipur price" would only mean something for Dhaka's rows. An average over "my neighbours" means the same thing
+  on every row. The individual neighbour prices are still shown in the app.
+- **Missing neighbours** (a neighbour that does not sell the commodity) are left out of the average; if none sells
+  it, the value is left empty, which XGBoost handles itself. This keeps exactly the same rows in Set A and Set B.
+- **Horizon** is 1-6 months. Horizon 1 is the Forecast model's own target (next month). Longer horizons are
+  predicted directly (month t to month t+h), because a step-by-step spatial forecast would also need every
+  neighbour's future prices.
+- **Testing.** The latest 2-6 months (default 3) are held out. Both models are trained only on prices that would
+  have been known when the first test forecast was made, then scored with MAE, RMSE, MAPE and R² (R² only with
+  5 or more test rows). "Improvement" is (A - B) / A, so a positive number means Set B made smaller errors.
+  Results can be shown for one district and commodity, one commodity across all districts, or everything; the
+  single-series view has only as many test rows as test months, so conclusions should rest on the wider views.
+- The app also shows both models' next prediction, a chart of real vs predicted prices over the test months, and
+  how much of Set B's learning came from the spatial features (feature importance).
+
+The experiment only starts after pressing **Run experiment** (training takes a few seconds, and Streamlit runs
+every tab on each click); after that, results are cached and changing the district or commodity is instant.
+
+**Reading the result on generated data.** On the current dataset Set A and Set B score within about 1% of each
+other and the spatial features carry almost no importance. That is expected: each generated monthly series has
+its own independent random noise, so neighbouring districts share a trend but no month-to-month movement. This is
+not evidence for or against spatial effects in real markets. The experiment uses the same monthly data as the rest
+of the app, so once real monthly prices are uploaded it runs on them automatically.
 
 **Category.** Every commodity is tagged Chicken, Rice or Fish - directly from which raw file it came from
 (`chicken.csv`, `rice.csv`, `fish.csv`), never guessed from the name. This powers the Admin Statistics tab and
@@ -164,6 +212,7 @@ requirements-dev.txt        extra packages for the notebooks and the tests
 .streamlit/config.toml      theme and server settings
 data/raw/                   DAM price files (chicken, rice, fish)
 data/processed/             cleaned district prices, the generated monthly series, users, points and pending submissions
+data/reference/             district_neighbors.csv - the editable geographic neighbour list for the spatial experiment
 models/                     the trained forecast model (JSON) and its list of input columns
 notebooks/                  01_data_preparation.ipynb, 02_train_forecast_model.ipynb
 tests/                      automated tests
@@ -190,7 +239,8 @@ python -m pytest -q
 ```
 
 The tests cover the upload checks, the real-versus-generated rule, undo, the forecast (including that it always starts
-next month and uses exactly the inputs the model was trained on), the cross-district estimate, and the data files.
+next month and uses exactly the inputs the model was trained on), the cross-district estimate, the data files, and the spatial experiment (the neighbour list is symmetric and complete,
+Set B is Set A plus only the spatial features, and no training price comes from after the test period).
 
 ## Troubleshooting
 
@@ -205,6 +255,8 @@ This takes a few seconds and needs no download.
 - The monthly history is generated from yearly averages, so it contains no real month-to-month movement or seasonality.
   Forecasts are therefore only indicative until real monthly prices are uploaded.
 - The Cross-district tab assumes the price gap between two districts stays the same; the ratio changed between 2025 and 2026.
+- The spatial-aware experiment cannot show a real spatial effect on the generated monthly data (see its section above).
+  A few river borders in `district_neighbors.csv` were judgment calls and are worth checking against a map.
 - Tree-based models such as XGBoost cannot extrapolate beyond the price range they have seen.
 - Predictions can be wrong and must not be the only basis for a decision.
 - The name/phone login has no password, so it is a light throttle on repeat use, not a verified identity (see "Accounts" above).

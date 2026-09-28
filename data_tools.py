@@ -1063,3 +1063,304 @@ def dataset_summary(monthly):
         "latest_month": used["date"].max(),
         "real_series": int(real.groupby(["location", "commodity"]).ngroups),
     }
+
+
+# ================================================================ SPATIAL-AWARE FORECASTING EXPERIMENT (Cross-district tab)
+# Research question (Gap 2): does adding NEIGHBOURING districts' prices as model inputs improve forecasting
+# compared with using only the target district's own history?
+#
+# This is NOT the price-ratio estimate above. cross_district_estimate converts one known price into another
+# district's price with a fixed ratio - no learning happens. Here, neighbouring prices are fed into the model
+# as input FEATURES, so the model itself has to learn whether (and how much) they help.
+#
+# The experiment trains the SAME model (_new_model: same algorithm, same settings, same seed) twice, on the
+# SAME rows, with the SAME train/test split and the SAME target. The only difference is the input columns:
+#
+#   Set A (baseline)       exactly the Forecast model's inputs: price_per_kg, lag1, lag2, lag3, month_num,
+#                          time_index, and the one-hot location_/commodity_ columns (see build_training_table).
+#   Set B (spatial-aware)  every Set A column, PLUS the SPATIAL_FEATURES below.
+#
+# So any difference in accuracy between A and B can only come from the spatial columns.
+#
+# Timing convention (identical to build_training_table): a row describes month t for one district+commodity,
+# "price_per_kg" is that month's price and "lag1" is month t-1. The model predicts month t+horizon. Every
+# spatial feature is also taken from month t or t-1, so nothing the model sees comes from the month it is
+# predicting - the same information would genuinely be available on the day the forecast is made.
+#
+#   nbr_mean_price   average price of this commodity across the district's geographic neighbours, month t
+#   nbr_mean_lag1    the same neighbour average one month earlier (t-1) - lets the model see a neighbour trend
+#   div_mean_price   average price of this commodity across the rest of the district's DIVISION, month t
+#                    (the target district itself is left out, so this is genuinely "other districts")
+#   ref_gap          this district's price minus the REFERENCE_DISTRICT's price, month t - how far above or
+#                    below the main reference market this district currently sits
+#
+# Why neighbour AVERAGES rather than one column per neighbour (e.g. "Gazipur lag1", "Narayanganj lag1")?
+# The Forecast model is ONE model shared across every district and commodity. A column called "Gazipur lag1"
+# would only mean something for Dhaka's rows and be empty for every other district, and training a separate
+# model per district instead would leave only ~14 training months each - far too few. An average over "my
+# neighbours" means the same thing on every row, so one pooled model can learn from it everywhere. The
+# individual neighbours' prices are still shown in the app, so it stays clear what went into the average.
+#
+# Missing values: a neighbour that does not sell this commodity simply does not count towards the average.
+# If NO neighbour sells it, the spatial value is left empty (NaN) - XGBoost handles missing values natively,
+# which keeps exactly the same rows in Set A and Set B (dropping them would change the comparison).
+
+NEIGHBOURS_PATH = "data/reference/district_neighbors.csv"   # hand-editable: target_district, neighbour_district
+RAW_FILES = ("data/raw/chicken.csv", "data/raw/rice.csv", "data/raw/fish.csv")   # the division of every district comes from here
+REFERENCE_DISTRICT = "Dhaka"         # the reference market for ref_gap - the capital and largest wholesale hub
+SPATIAL_FEATURES = ["nbr_mean_price", "nbr_mean_lag1", "div_mean_price", "ref_gap"]
+SPATIAL_MAX_HORIZON = 6              # 21 months of history leaves too few training months for longer horizons
+
+
+def load_district_neighbours(path=NEIGHBOURS_PATH):
+    """The predefined geographic neighbour list (method 1: fixed borders, NOT picked from price correlations).
+
+    One row per (target_district, neighbour_district). The file lists both directions explicitly, so editing
+    it is just adding or removing a line - nothing about neighbours is hard-coded anywhere else.
+    """
+    if not os.path.exists(path):
+        raise ValueError(f"'{path}' is missing - the spatial experiment needs the district neighbour list.")
+    df = pd.read_csv(path)
+    missing = {"target_district", "neighbour_district"} - set(df.columns)
+    if missing:
+        raise ValueError(f"'{path}' needs the columns target_district, neighbour_district.")
+    df = df[["target_district", "neighbour_district"]].astype(str).apply(lambda s: s.str.strip())
+    df = df[df["target_district"] != df["neighbour_district"]]         # a district is never its own neighbour
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+def load_district_divisions():
+    """District -> division, read from the DAM raw files' own "Division" column (their first two columns are
+    Division and District - the same layout notebook 01 relies on). Reusing the project's own source means
+    there is no second, hand-typed division list that could drift out of step with the data."""
+    parts = [pd.read_csv(p, encoding="utf-8-sig", usecols=[0, 1]) for p in RAW_FILES if os.path.exists(p)]
+    if not parts:
+        return {}
+    raw = pd.concat(parts, ignore_index=True)
+    raw.columns = ["division", "location"]
+    raw = raw.dropna().astype(str).apply(lambda s: s.str.strip()).drop_duplicates("location")
+    return raw.set_index("location")["division"].to_dict()
+
+
+def spatial_signature():
+    """Cache key for the experiment: changes when the price data, the neighbour list or the raw files change."""
+    return data_signature() + tuple(os.path.getmtime(p) if os.path.exists(p) else 0 for p in (NEIGHBOURS_PATH,) + RAW_FILES)
+
+
+def spatial_feature_frame(monthly, neighbours, divisions, reference=REFERENCE_DISTRICT):
+    """The four SPATIAL_FEATURES for every (location, commodity, month) in `monthly`.
+
+    Built from the full monthly table (not the training table), so the same values can be attached both to
+    training rows and to the latest month used for a live prediction.
+    """
+    prices = monthly[["location", "commodity", "date", "price_per_kg"]].copy()
+
+    # Each month's price next to the PREVIOUS month's price for the same series. Matching on the date moved
+    # forward one month (instead of shift()) means a gap in a series gives an empty value, never a wrong one.
+    prev = prices.assign(date=prices["date"] + pd.DateOffset(months=1)).rename(columns={"price_per_kg": "price_prev"})
+    prices = prices.merge(prev, on=["location", "commodity", "date"], how="left")
+
+    # --- neighbour averages: attach every neighbour's price to each row, then average per row
+    nb = prices[["location", "commodity", "date"]].merge(
+        neighbours.rename(columns={"target_district": "location", "neighbour_district": "neighbour"}), on="location")
+    nb = nb.merge(prices.rename(columns={"location": "neighbour"}), on=["neighbour", "commodity", "date"], how="inner")
+    nbr = (nb.groupby(["location", "commodity", "date"])
+             .agg(nbr_mean_price=("price_per_kg", "mean"), nbr_mean_lag1=("price_prev", "mean"))
+             .reset_index())
+
+    # --- division average EXCLUDING the district itself: (division total - own price) / (division count - 1)
+    prices["division"] = prices["location"].map(divisions)
+    grp = prices.groupby(["division", "commodity", "date"])["price_per_kg"]
+    div_sum, div_n = grp.transform("sum"), grp.transform("count")
+    prices["div_mean_price"] = ((div_sum - prices["price_per_kg"]) / (div_n - 1)).where(div_n > 1)
+
+    # --- gap to the reference market in the same month (0 for the reference district itself)
+    ref = prices.loc[prices["location"] == reference, ["commodity", "date", "price_per_kg"]].rename(
+        columns={"price_per_kg": "ref_price"})
+    prices = prices.merge(ref, on=["commodity", "date"], how="left")
+    prices["ref_gap"] = prices["price_per_kg"] - prices["ref_price"]
+
+    out = prices.merge(nbr, on=["location", "commodity", "date"], how="left")
+    return out[["location", "commodity", "date"] + SPATIAL_FEATURES]
+
+
+def build_spatial_training_table(monthly, neighbours, divisions, horizon=1, reference=REFERENCE_DISTRICT):
+    """The Forecast model's own training table (build_training_table, reused unchanged) with the spatial
+    features added and the target set `horizon` months ahead.
+
+    horizon=1 gives exactly the Forecast model's target (next month). For horizon h > 1 this is a DIRECT
+    forecast - the model learns "month t -> month t+h" in one step - rather than the Forecast tab's recursive
+    method, because a recursive spatial forecast would also need every neighbour's future prices.
+    """
+    table = build_training_table(monthly).drop(columns="target_next_month")
+    target = monthly[["location", "commodity", "date", "price_per_kg"]].rename(columns={"price_per_kg": "target"})
+    target["date"] = target["date"] - pd.DateOffset(months=horizon)       # the price h months later, lined up with month t
+    table = table.merge(target, on=["location", "commodity", "date"], how="inner")
+    table["target_date"] = table["date"] + pd.DateOffset(months=horizon)
+    spatial = spatial_feature_frame(monthly, neighbours, divisions, reference)
+    table = table.merge(spatial, on=["location", "commodity", "date"], how="left")
+    return table.sort_values(["location", "commodity", "date"]).reset_index(drop=True)
+
+
+def _error_metrics(actual, predicted):
+    """MAE, RMSE, MAPE and R² for one set of predictions (R² is left empty when there are too few rows or no
+    variation in the actual prices for it to mean anything)."""
+    actual = pd.Series(actual, dtype=float).reset_index(drop=True)
+    err = actual - pd.Series(predicted, dtype=float).reset_index(drop=True)
+    sst = float(((actual - actual.mean()) ** 2).sum())
+    return {
+        "n": int(len(actual)),
+        "mae": float(err.abs().mean()),                          # average size of the mistake, Tk/kg
+        "rmse": float((err ** 2).mean() ** 0.5),                 # like MAE but punishes big misses more
+        "mape": float((err.abs() / actual).mean() * 100),        # the same mistake as a % of the price
+        "r2": float(1 - (err ** 2).sum() / sst) if len(actual) >= 5 and sst > 0 else None,
+    }
+
+
+def run_spatial_experiment(monthly, neighbours, divisions, horizon=1, test_months=3, reference=REFERENCE_DISTRICT):
+    """Trains Set A and Set B with an identical honest hold-out test, then trains both again on everything
+    for live predictions (the same two-step method as train_candidate).
+
+    Split: the last `test_months` forecast-origin months are the test set; the training set is every row
+    whose TARGET month is not later than the first test origin - i.e. only prices that would really have been
+    known when the first test forecast was made. For horizon=1 this is exactly train_candidate's split.
+
+    Returns the trained models, feature lists and a per-row table of test predictions; score_spatial_experiment
+    turns that table into metrics for any slice (one series, one commodity, or everything).
+    """
+    if not 1 <= horizon <= SPATIAL_MAX_HORIZON:
+        raise ValueError(f"The horizon must be between 1 and {SPATIAL_MAX_HORIZON} months.")
+    data = monthly[monthly["date"] <= current_month_start()]
+    table = build_spatial_training_table(data, neighbours, divisions, horizon, reference)
+    origins = sorted(table["date"].drop_duplicates())
+    if len(table) < 200 or len(origins) < test_months + 3:
+        raise ValueError("Not enough data to train and test the spatial experiment at this horizon.")
+
+    test_origins = origins[-test_months:]
+    is_test = table["date"].isin(test_origins)
+    is_train = table["target_date"] <= test_origins[0]            # no training price from after the first test forecast
+
+    # One-hot encoding exactly like train_candidate, keeping the plain names aside for slicing results later.
+    meta = table[["location", "commodity", "date", "target_date", "source"]]
+    enc = pd.get_dummies(table.drop(columns=["target_date"]), columns=["location", "commodity"])
+    not_inputs = {"date", "target", "source"}
+    features_a = [c for c in enc.columns if c not in not_inputs and c not in SPATIAL_FEATURES]
+    features_b = features_a + SPATIAL_FEATURES                  # Set B = Set A + spatial, nothing else differs
+    y = enc["target"]
+
+    # Same model, same rows, same split - the ONLY difference between these two fits is the column list.
+    model_a = _new_model().fit(enc.loc[is_train, features_a], y[is_train])
+    model_b = _new_model().fit(enc.loc[is_train, features_b], y[is_train])
+
+    results = meta[is_test].copy()
+    results["actual"] = y[is_test].values
+    results["current_price"] = enc.loc[is_test, "price_per_kg"].values     # for the naive "no change" reference
+    results["pred_a"] = model_a.predict(enc.loc[is_test, features_a])
+    results["pred_b"] = model_b.predict(enc.loc[is_test, features_b])
+
+    return {
+        "horizon": horizon,
+        "test_months": test_months,
+        "reference": reference,
+        "features_a": features_a,
+        "features_b": features_b,
+        "train_rows": int(is_train.sum()),
+        "results": results.reset_index(drop=True),
+        # Final models trained on every row, used only for the live "next price" predictions.
+        "final_a": _new_model().fit(enc[features_a], y),
+        "final_b": _new_model().fit(enc[features_b], y),
+        "spatial": spatial_feature_frame(data, neighbours, divisions, reference),
+    }
+
+
+def score_spatial_experiment(experiment, location=None, commodity=None):
+    """Metrics for Set A vs Set B on the test rows, optionally narrowed to one district and/or commodity.
+
+    improvement_* is (A - B) / A: positive means the spatial-aware model made SMALLER errors than baseline.
+    b_wins_pct is how often, row by row, Set B's error was smaller than Set A's.
+    """
+    res = experiment["results"]
+    if location is not None:
+        res = res[res["location"] == location]
+    if commodity is not None:
+        res = res[res["commodity"] == commodity]
+    if res.empty:
+        raise ValueError("No test rows for this selection.")
+    a = _error_metrics(res["actual"], res["pred_a"])
+    b = _error_metrics(res["actual"], res["pred_b"])
+    naive = _error_metrics(res["actual"], res["current_price"])
+    b_better = (res["actual"] - res["pred_b"]).abs() < (res["actual"] - res["pred_a"]).abs()
+    return {
+        "baseline": a, "spatial": b, "naive": naive,
+        "improvement_mae_pct": (a["mae"] - b["mae"]) / a["mae"] * 100 if a["mae"] else 0.0,
+        "improvement_rmse_pct": (a["rmse"] - b["rmse"]) / a["rmse"] * 100 if a["rmse"] else 0.0,
+        "b_wins_pct": float(b_better.mean() * 100),
+        "real_rows": int((res["source"] == "uploaded").sum()),
+        "rows": res,
+    }
+
+
+def spatial_prediction(experiment, monthly, location, commodity):
+    """Live prediction for `horizon` months after the latest known month, from both final models, plus the
+    exact spatial inputs used - so the app can show what the spatial model saw."""
+    data = monthly[monthly["date"] <= current_month_start()]
+    hist = data[(data["location"] == location) & (data["commodity"] == commodity)].sort_values("date")
+    if len(hist) < 4:
+        raise ValueError("Not enough monthly history for this district and commodity.")
+    last_date = hist["date"].max()
+    last_time_index = (last_date.year - 2025) * 12 + (last_date.month - 1)
+    # make_feature_row (the Forecast tab's own function) builds the Set A inputs for the latest month; step=0
+    # means "describe the last known month itself", which is exactly one training-table row.
+    row = make_feature_row(experiment["features_a"], hist["price_per_kg"].tolist(), last_date, last_time_index,
+                           0, location, commodity)
+    sp = experiment["spatial"]
+    sp_row = sp[(sp["location"] == location) & (sp["commodity"] == commodity) & (sp["date"] == last_date)]
+    for col in SPATIAL_FEATURES:
+        row[col] = float(sp_row[col].iloc[0]) if len(sp_row) and pd.notna(sp_row[col].iloc[0]) else float("nan")
+    x = pd.DataFrame([row])
+    return {
+        "last_date": last_date,
+        "last_price": float(hist["price_per_kg"].iloc[-1]),
+        "target_date": last_date + pd.DateOffset(months=experiment["horizon"]),
+        "pred_a": float(experiment["final_a"].predict(x[experiment["features_a"]])[0]),
+        "pred_b": float(experiment["final_b"].predict(x[experiment["features_b"]])[0]),
+        "spatial_inputs": {col: row[col] for col in SPATIAL_FEATURES},
+        "source": str(hist["source"].iloc[-1]) if "source" in hist.columns else "generated",
+    }
+
+
+def neighbour_prices(monthly, neighbours, divisions, location, commodity):
+    """One row per predefined neighbour of `location`: its division, whether it sells this commodity, and its
+    latest price - the individual values behind nbr_mean_price, shown in the app."""
+    data = monthly[(monthly["date"] <= current_month_start()) & (monthly["commodity"] == commodity)]
+    latest = data.sort_values("date").groupby("location").tail(1).set_index("location")
+    rows = []
+    for nb in sorted(neighbours.loc[neighbours["target_district"] == location, "neighbour_district"]):
+        has = nb in latest.index
+        rows.append({
+            "Neighbour": nb,
+            "Division": divisions.get(nb, "?"),
+            "Sells this commodity": "yes" if has else "no",
+            "Latest month": latest.loc[nb, "date"].strftime("%Y-%m") if has else "",
+            "Latest price (Tk/kg)": round(float(latest.loc[nb, "price_per_kg"]), 2) if has else None,
+        })
+    return pd.DataFrame(rows, columns=["Neighbour", "Division", "Sells this commodity", "Latest month",
+                                       "Latest price (Tk/kg)"])
+
+
+def spatial_feature_importance(experiment):
+    """Share of Set B's total split gain coming from each spatial feature - evidence of whether the model
+    actually USED the spatial inputs (0% would mean it ignored them entirely)."""
+    booster = experiment["final_b"].get_booster()
+    gain = booster.get_score(importance_type="total_gain")      # keyed by feature name; unused features are absent
+    total = sum(gain.values()) or 1.0
+    out = pd.DataFrame({"feature": SPATIAL_FEATURES,
+                        "gain_share_pct": [gain.get(f, 0.0) / total * 100 for f in SPATIAL_FEATURES]})
+    return out, float(out["gain_share_pct"].sum())
+
+
+def check_neighbour_names(neighbours, known_locations):
+    """District names in the neighbour file that do not appear in the price data (usually a typo after an
+    edit) - shown to administrators so a silently-ignored neighbour is easy to spot."""
+    names = set(neighbours["target_district"]) | set(neighbours["neighbour_district"])
+    return sorted(names - set(known_locations))
